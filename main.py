@@ -33,8 +33,9 @@ def health():
 
 @app.post("/translate")
 async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
-    if not file.filename.lower().endswith(".xlsx"):
-        raise HTTPException(status_code=400, detail="Upload a .xlsx file")
+    fname = (file.filename or "").lower()
+    if not (fname.endswith(".xlsx") or fname.endswith(".xlsm")):
+        raise HTTPException(status_code=400, detail="Upload a .xlsx or .xlsm file")
 
     raw = await file.read()
     wb = load_workbook(io.BytesIO(raw), data_only=False, keep_vba=False)
