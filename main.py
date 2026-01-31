@@ -38,7 +38,9 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
         raise HTTPException(status_code=400, detail="Upload a .xlsx or .xlsm file")
 
     raw = await file.read()
-    wb = load_workbook(io.BytesIO(raw), data_only=False, keep_vba=False)
+    is_xlsm = fname.endswith(".xlsm")
+    wb = load_workbook(io.BytesIO(raw), data_only=False, keep_vba=is_xlsm)
+
 
     # Collecte des cellules à traduire : (sheet, addr, original)
     targets = []
@@ -122,7 +124,9 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
     wb.save(out)
     out.seek(0)
 
-    out_name = f"{file.filename[:-5]}_EN.xlsx"
+    base = file.filename.rsplit(".", 1)[0] if file.filename else "translated"
+    out_ext = "xlsm" if is_xlsm else "xlsx"
+    out_name = f"{base}_EN.{out_ext}"
     return StreamingResponse(
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
