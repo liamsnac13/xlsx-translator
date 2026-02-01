@@ -1,15 +1,18 @@
-import io
 import os
 import re
+import io
+import shutil
+import tempfile
+from typing import List, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from openpyxl import load_workbook
 from openai import OpenAI
 
 app = FastAPI()
 
-# OpenAI client (clé via variable d'env OPENAI_API_KEY)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 # Grec moderne + polytonique
@@ -28,9 +31,13 @@ def is_formula_cell(cell) -> bool:
     return isinstance(v, str) and v.lstrip().startswith("=")
 
 
-def chunked(items, n):
-    for i in range(0, len(items), n):
-        yield items[i:i + n]
+def cleanup_files(*paths: str) -> None:
+    for p in paths:
+        try:
+            if p and os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
 
 
 @app.get("/health")
@@ -40,105 +47,54 @@ def health():
 
 @app.post("/translate")
 async def translate(
-    file: UploadFile = File(None),     # n8n peut envoyer "file"
-    file0: UploadFile = File(None),    # ou parfois "file0"
-    model: str = "gpt-4.1-mini",
+    file: UploadFile = File(...),
+    model: str = Query(default="gpt-4.1-mini"),
+    batch_size: int = Query(default=60, ge=10, le=200),
 ):
-    upload = file or file0
-    if upload is None:
-        raise HTTPException(status_code=422, detail="Missing file (expected form-data field 'file')")
+    # ---- Validate filename/ext ----
+    original_name = file.filename or "input.xlsx"
+    fname = original_name.lower()
 
-    # --- Validate extension (xlsx/xlsm) ---
-    fname = (upload.filename or "").lower().strip()
-    ctype = (upload.content_type or "").lower().strip()
+    if not (fname.endswith(".xlsx") or fname.endswith(".xlsm")):
+        raise HTTPException(status_code=400, detail="Upload a .xlsx or .xlsm file")
 
-    # Content-Types possibles
-    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    XLSM_MIME = "application/vnd.ms-excel.sheet.macroenabled.12"
-
-    # On accepte si:
-    # - extension .xlsx/.xlsm
-    # - OU content-type explicite xlsx/xlsm (utile quand n8n/clients mettent octet-stream ou filename bizarre)
-    ext_ok = fname.endswith(".xlsx") or fname.endswith(".xlsm")
-    mime_ok = (ctype == XLSX_MIME) or (ctype == XLSM_MIME)
-
-    if not ext_ok and not mime_ok:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Upload a .xlsx or .xlsm file (multipart/form-data). "
-                f"Got filename='{upload.filename}', content_type='{upload.content_type}'."
-            ),
-        )
-
-    is_xlsm = fname.endswith(".xlsm") or (ctype == XLSM_MIME)
-
-    # --- Read input ---
-    raw = await upload.read()
-
-    # Keep VBA only for xlsm
-    try:
-        wb = load_workbook(
-            io.BytesIO(raw),
-            data_only=False,          # keep formulas as formulas
-            keep_vba=is_xlsm          # preserve macros if xlsm
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Cannot open workbook: {e}")
-
-    # --- Collect cells to translate ---
-    targets = []
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                v = cell.value
-                if v is None:
-                    continue
-                if is_formula_cell(cell):
-                    continue
-                if is_greek_text(v):
-                    targets.append((ws.title, cell.coordinate, v))
-
-    # --- Output filename (keep ext if possible) ---
-    if upload.filename and "." in upload.filename:
-        base = upload.filename.rsplit(".", 1)[0]
-    else:
-        base = "translated"
-
+    is_xlsm = fname.endswith(".xlsm")
     out_ext = "xlsm" if is_xlsm else "xlsx"
+    base = original_name.rsplit(".", 1)[0]
     out_name = f"{base}_EN.{out_ext}"
 
-    # If nothing to translate, return as-is (but with _EN + correct ext)
-    if not targets:
-        out = io.BytesIO()
-        wb.save(out)
-        out.seek(0)
-        return StreamingResponse(
-            out,
-            media_type=XLSX_MIME,
-            headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
+    # ---- Save upload to disk (avoid raw bytes in RAM) ----
+    # Important on Railway: stop duplicating big buffers in memory.
+    in_suffix = ".xlsm" if is_xlsm else ".xlsx"
+    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=in_suffix)
+    tmp_in_path = tmp_in.name
+    tmp_in.close()
+
+    try:
+        with open(tmp_in_path, "wb") as f:
+            # stream copy upload -> disk
+            file.file.seek(0)
+            shutil.copyfileobj(file.file, f)
+    except Exception as e:
+        cleanup_files(tmp_in_path)
+        raise HTTPException(status_code=400, detail=f"Failed to store upload: {e}")
+
+    # ---- Load workbook (still uses RAM, but less peak overall) ----
+    try:
+        wb = load_workbook(
+            filename=tmp_in_path,
+            data_only=False,
+            keep_vba=is_xlsm,  # keep macros if xlsm
         )
+    except Exception as e:
+        cleanup_files(tmp_in_path)
+        raise HTTPException(status_code=400, detail=f"Cannot open workbook: {e}")
 
-    # --- Cache repeated strings ---
-    cache = {}
+    # ---- Translation loop (batch on the fly, no huge targets list) ----
+    cache = {}  # repeated strings -> translated
 
-    BATCH_SIZE = 80
-
-    for batch in chunked(targets, BATCH_SIZE):
-        to_translate = []
-        idx_map = []  # (wsname, addr, orig)
-
-        for wsname, addr, orig in batch:
-            if orig in cache:
-                wb[wsname][addr].value = cache[orig]
-            else:
-                to_translate.append(orig)
-                idx_map.append((wsname, addr, orig))
-
-        if not to_translate:
-            continue
-
-        user_text = "\n".join(to_translate)
+    def translate_lines(lines: List[str]) -> List[str]:
+        user_text = "\n".join(lines)
 
         resp = client.responses.create(
             model=model,
@@ -158,24 +114,82 @@ async def translate(
         )
 
         out_lines = resp.output_text.splitlines()
-
-        if len(out_lines) != len(to_translate):
+        if len(out_lines) != len(lines):
             raise HTTPException(
                 status_code=500,
-                detail=f"Translation line mismatch: expected {len(to_translate)}, got {len(out_lines)}"
+                detail=f"Translation line mismatch: expected {len(lines)}, got {len(out_lines)}",
             )
+        return out_lines
 
-        for (wsname, addr, orig), translated in zip(idx_map, out_lines):
-            cache[orig] = translated
-            wb[wsname][addr].value = translated
+    # Collect pending cells for a batch: (cell, original_text)
+    pending: List[Tuple[object, str]] = []
+    pending_texts: List[str] = []
 
-    # --- Return translated workbook ---
-    out = io.BytesIO()
-    wb.save(out)
-    out.seek(0)
+    try:
+        for ws in wb.worksheets:
+            for row in ws.iter_rows():
+                for cell in row:
+                    v = cell.value
+                    if v is None:
+                        continue
+                    if is_formula_cell(cell):
+                        continue
+                    if not is_greek_text(v):
+                        continue
 
-    return StreamingResponse(
-        out,
-        media_type=XLSX_MIME,
-        headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
+                    # cache hit => write immediately
+                    if v in cache:
+                        cell.value = cache[v]
+                        continue
+
+                    pending.append((cell, v))
+                    pending_texts.append(v)
+
+                    if len(pending_texts) >= batch_size:
+                        translated = translate_lines(pending_texts)
+                        for (c, orig), tr in zip(pending, translated):
+                            cache[orig] = tr
+                            c.value = tr
+                        pending.clear()
+                        pending_texts.clear()
+
+        # flush remaining
+        if pending_texts:
+            translated = translate_lines(pending_texts)
+            for (c, orig), tr in zip(pending, translated):
+                cache[orig] = tr
+                c.value = tr
+
+    except HTTPException:
+        # re-raise cleanly
+        cleanup_files(tmp_in_path)
+        raise
+    except Exception as e:
+        cleanup_files(tmp_in_path)
+        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+
+    # ---- Save output to disk (avoid BytesIO RAM spike) ----
+    tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=f".{out_ext}")
+    tmp_out_path = tmp_out.name
+    tmp_out.close()
+
+    try:
+        wb.save(tmp_out_path)
+    except Exception as e:
+        cleanup_files(tmp_in_path, tmp_out_path)
+        raise HTTPException(status_code=500, detail=f"Failed to save output: {e}")
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+    # cleanup input immediately, keep output until response is sent
+    cleanup_files(tmp_in_path)
+
+    return FileResponse(
+        path=tmp_out_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=out_name,
+        background=BackgroundTask(cleanup_files, tmp_out_path),
     )
