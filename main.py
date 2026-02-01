@@ -39,16 +39,42 @@ def health():
 
 
 @app.post("/translate")
-async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
-    # --- Validate extension (xlsx/xlsm) ---
-    fname = (file.filename or "").lower()
-    if not (fname.endswith(".xlsx") or fname.endswith(".xlsm")):
-        raise HTTPException(status_code=400, detail="Upload a .xlsx or .xlsm file")
+async def translate(
+    file: UploadFile = File(None),     # n8n peut envoyer "file"
+    file0: UploadFile = File(None),    # ou parfois "file0"
+    model: str = "gpt-4.1-mini",
+):
+    upload = file or file0
+    if upload is None:
+        raise HTTPException(status_code=422, detail="Missing file (expected form-data field 'file')")
 
-    is_xlsm = fname.endswith(".xlsm")
+    # --- Validate extension (xlsx/xlsm) ---
+    fname = (upload.filename or "").lower().strip()
+    ctype = (upload.content_type or "").lower().strip()
+
+    # Content-Types possibles
+    XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    XLSM_MIME = "application/vnd.ms-excel.sheet.macroenabled.12"
+
+    # On accepte si:
+    # - extension .xlsx/.xlsm
+    # - OU content-type explicite xlsx/xlsm (utile quand n8n/clients mettent octet-stream ou filename bizarre)
+    ext_ok = fname.endswith(".xlsx") or fname.endswith(".xlsm")
+    mime_ok = (ctype == XLSX_MIME) or (ctype == XLSM_MIME)
+
+    if not ext_ok and not mime_ok:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Upload a .xlsx or .xlsm file (multipart/form-data). "
+                f"Got filename='{upload.filename}', content_type='{upload.content_type}'."
+            ),
+        )
+
+    is_xlsm = fname.endswith(".xlsm") or (ctype == XLSM_MIME)
 
     # --- Read input ---
-    raw = await file.read()
+    raw = await upload.read()
 
     # Keep VBA only for xlsm
     try:
@@ -61,7 +87,6 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
         raise HTTPException(status_code=400, detail=f"Cannot open workbook: {e}")
 
     # --- Collect cells to translate ---
-    # targets: (sheet_name, cell_address, original_text)
     targets = []
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -74,8 +99,12 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
                 if is_greek_text(v):
                     targets.append((ws.title, cell.coordinate, v))
 
-    # --- Output filename (keep ext) ---
-    base = file.filename.rsplit(".", 1)[0] if file.filename else "translated"
+    # --- Output filename (keep ext if possible) ---
+    if upload.filename and "." in upload.filename:
+        base = upload.filename.rsplit(".", 1)[0]
+    else:
+        base = "translated"
+
     out_ext = "xlsm" if is_xlsm else "xlsx"
     out_name = f"{base}_EN.{out_ext}"
 
@@ -86,14 +115,13 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
         out.seek(0)
         return StreamingResponse(
             out,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type=XLSX_MIME,
             headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
         )
 
     # --- Cache repeated strings ---
     cache = {}
 
-    # 80 lignes par batch = OK en général. Tu peux baisser si timeout.
     BATCH_SIZE = 80
 
     for batch in chunked(targets, BATCH_SIZE):
@@ -131,7 +159,6 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
 
         out_lines = resp.output_text.splitlines()
 
-        # Strict mapping: 1 input line -> 1 output line
         if len(out_lines) != len(to_translate):
             raise HTTPException(
                 status_code=500,
@@ -149,6 +176,6 @@ async def translate(file: UploadFile = File(...), model: str = "gpt-4.1-mini"):
 
     return StreamingResponse(
         out,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=XLSX_MIME,
         headers={"Content-Disposition": f'attachment; filename="{out_name}"'}
     )
