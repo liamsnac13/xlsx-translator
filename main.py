@@ -1,23 +1,22 @@
 import os
 import re
-import io
+import json
 import shutil
 import tempfile
-import json
-from typing import List, Tuple, Dict, Any
+from typing import Dict, List, Tuple
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
+
 from openpyxl import load_workbook
 from openai import OpenAI
 
 app = FastAPI()
 
-# OpenAI client (clé via variable d'env OPENAI_API_KEY)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-# Grec moderne + polytonique
+# Greek (modern + polytonic)
 GREEK_RE = re.compile(r"[\u0370-\u03FF\u1F00-\u1FFF]")
 
 
@@ -26,7 +25,6 @@ def is_greek_text(v) -> bool:
 
 
 def is_formula_cell(cell) -> bool:
-    # openpyxl: data_type "f" = formula
     if getattr(cell, "data_type", None) == "f":
         return True
     v = cell.value
@@ -42,28 +40,19 @@ def cleanup_files(*paths: str) -> None:
             pass
 
 
-def _strip_code_fences(s: str) -> str:
-    """
-    Defensive: parfois un modèle renvoie ```json ... ```
-    On enlève les fences si présentes.
-    """
-    s = (s or "").strip()
-    if s.startswith("```"):
-        # remove first fence line
-        s = s.split("\n", 1)[1] if "\n" in s else ""
-        # remove last fence
-        if "```" in s:
-            s = s.rsplit("```", 1)[0]
-    return s.strip()
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-def translate_batch_json(texts: List[str], model: str) -> List[str]:
+def translate_batch_json(lines: List[str], model: str) -> List[str]:
     """
-    Envoie une LISTE JSON [{id, text}, ...] et attend une LISTE JSON
-    [{id, translation}, ...] — même taille, mêmes ids.
-    => robuste aux retours à la ligne dans les cellules.
+    Robust translation:
+    - Send JSON array of strings
+    - Require JSON array output with same length
+    This avoids "line mismatch" due to newline weirdness.
     """
-    payload = [{"id": i, "text": t} for i, t in enumerate(texts)]
+    payload = json.dumps(lines, ensure_ascii=False)
 
     resp = client.responses.create(
         model=model,
@@ -71,65 +60,35 @@ def translate_batch_json(texts: List[str], model: str) -> List[str]:
             {
                 "role": "system",
                 "content": (
-                    "You translate Greek financial spreadsheet labels into clear English.\n"
+                    "You translate Greek spreadsheet labels into clear English.\n"
                     "Rules:\n"
-                    "- Do NOT change numbers, dates, tickers, abbreviations, or punctuation.\n"
+                    "- Keep numbers, dates, tickers, abbreviations, punctuation unchanged.\n"
                     "- Keep terminology consistent (Revenue, EBITDA, Working Capital).\n"
-                    "- Output MUST be valid JSON only.\n"
-                    "- Output MUST be a JSON array of objects: "
-                    "[{\"id\": <int>, \"translation\": <string>}]\n"
-                    "- The array MUST contain exactly the same ids as the input, "
-                    "no extra items, no missing items.\n"
-                    "- Do NOT add explanations, no markdown, no code fences.\n"
-                    "- IMPORTANT: Do NOT introduce new newline characters. "
-                    "If the source text contains newlines, keep them as-is.\n"
+                    "- Input is a JSON array of strings.\n"
+                    "- Output MUST be a JSON array of strings of the EXACT same length.\n"
+                    "- Do NOT add commentary. Output JSON only."
                 ),
             },
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            {"role": "user", "content": payload},
         ],
     )
 
-    raw_out = _strip_code_fences((resp.output_text or "").strip())
-
+    text = (resp.output_text or "").strip()
     try:
-        out_json = json.loads(raw_out)
+        out = json.loads(text)
     except Exception:
-        # on renvoie un bout pour debug sans exploser les logs
-        snippet = raw_out[:300].replace("\n", "\\n")
-        raise HTTPException(status_code=500, detail=f"Model did not return valid JSON. Got: {snippet}")
+        raise HTTPException(status_code=500, detail=f"Model did not return JSON. Got: {text[:200]}")
 
-    if not isinstance(out_json, list) or len(out_json) != len(payload):
+    if not isinstance(out, list) or not all(isinstance(x, str) for x in out):
+        raise HTTPException(status_code=500, detail="Model output JSON is not a string array")
+
+    if len(out) != len(lines):
         raise HTTPException(
             status_code=500,
-            detail=f"Translation count mismatch: expected {len(payload)}, got {len(out_json) if isinstance(out_json, list) else 'non-list'}",
+            detail=f"Translation count mismatch: expected {len(lines)}, got {len(out)}",
         )
 
-    id2t: Dict[int, str] = {}
-    for obj in out_json:
-        if not isinstance(obj, dict) or "id" not in obj or "translation" not in obj:
-            raise HTTPException(status_code=500, detail="Invalid JSON schema from model output")
-        try:
-            i = int(obj["id"])
-        except Exception:
-            raise HTTPException(status_code=500, detail="Invalid 'id' type in model output")
-        id2t[i] = str(obj["translation"])
-
-    if len(id2t) != len(payload):
-        raise HTTPException(status_code=500, detail="Duplicate/missing ids in model output")
-
-    # Recompose dans l’ordre original (0..n-1)
-    out = []
-    for i in range(len(payload)):
-        if i not in id2t:
-            raise HTTPException(status_code=500, detail=f"Missing id {i} in model output")
-        out.append(id2t[i])
-
     return out
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 
 @app.post("/translate")
@@ -141,7 +100,6 @@ async def translate(
     # ---- Validate filename/ext ----
     original_name = file.filename or "input.xlsx"
     fname = original_name.lower()
-
     if not (fname.endswith(".xlsx") or fname.endswith(".xlsm")):
         raise HTTPException(status_code=400, detail="Upload a .xlsx or .xlsm file")
 
@@ -150,7 +108,7 @@ async def translate(
     base = original_name.rsplit(".", 1)[0]
     out_name = f"{base}_EN.{out_ext}"
 
-    # ---- Save upload to disk (avoid raw bytes in RAM) ----
+    # ---- Save upload to disk ----
     in_suffix = ".xlsm" if is_xlsm else ".xlsx"
     tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=in_suffix)
     tmp_in_path = tmp_in.name
@@ -164,25 +122,17 @@ async def translate(
         cleanup_files(tmp_in_path)
         raise HTTPException(status_code=400, detail=f"Failed to store upload: {e}")
 
-    # ---- Load workbook ----
+    # ---- PASS 1: scan in read_only mode (lower RAM) ----
+    # Collect only the coordinates + text (not whole cell objects)
+    to_translate_coords: List[Tuple[str, str, str]] = []  # (sheet_name, cell_coord, original_text)
     try:
-        wb = load_workbook(
+        wb_ro = load_workbook(
             filename=tmp_in_path,
+            read_only=True,
             data_only=False,
             keep_vba=is_xlsm,
         )
-    except Exception as e:
-        cleanup_files(tmp_in_path)
-        raise HTTPException(status_code=400, detail=f"Cannot open workbook: {e}")
-
-    # ---- Translation loop (batch on the fly) ----
-    cache: Dict[str, str] = {}
-
-    pending: List[Tuple[object, str]] = []  # (cell, original_text)
-    pending_texts: List[str] = []
-
-    try:
-        for ws in wb.worksheets:
+        for ws in wb_ro.worksheets:
             for row in ws.iter_rows():
                 for cell in row:
                     v = cell.value
@@ -190,38 +140,82 @@ async def translate(
                         continue
                     if is_formula_cell(cell):
                         continue
-                    if not is_greek_text(v):
-                        continue
-
-                    # Cache hit
-                    if v in cache:
-                        cell.value = cache[v]
-                        continue
-
-                    pending.append((cell, v))
-                    pending_texts.append(v)
-
-                    if len(pending_texts) >= batch_size:
-                        translated = translate_batch_json(pending_texts, model=model)
-                        for (c, orig), tr in zip(pending, translated):
-                            cache[orig] = tr
-                            c.value = tr
-                        pending.clear()
-                        pending_texts.clear()
-
-        # flush remaining
-        if pending_texts:
-            translated = translate_batch_json(pending_texts, model=model)
-            for (c, orig), tr in zip(pending, translated):
-                cache[orig] = tr
-                c.value = tr
-
-    except HTTPException:
-        cleanup_files(tmp_in_path)
-        raise
+                    if is_greek_text(v):
+                        to_translate_coords.append((ws.title, cell.coordinate, v))
     except Exception as e:
         cleanup_files(tmp_in_path)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {e}")
+        raise HTTPException(status_code=400, detail=f"Cannot read workbook: {e}")
+    finally:
+        try:
+            wb_ro.close()
+        except Exception:
+            pass
+
+    # Nothing to do -> return original as output (renamed)
+    if not to_translate_coords:
+        tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=f".{out_ext}")
+        tmp_out_path = tmp_out.name
+        tmp_out.close()
+        try:
+            # just copy input to output
+            shutil.copyfile(tmp_in_path, tmp_out_path)
+        except Exception as e:
+            cleanup_files(tmp_in_path, tmp_out_path)
+            raise HTTPException(status_code=500, detail=f"Failed to produce output: {e}")
+        finally:
+            cleanup_files(tmp_in_path)
+
+        return FileResponse(
+            path=tmp_out_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=out_name,
+            background=BackgroundTask(cleanup_files, tmp_out_path),
+        )
+
+    # ---- Translate in batches (with caching) ----
+    cache: Dict[str, str] = {}
+    translations: Dict[Tuple[str, str], str] = {}  # (sheet, coord) -> translated
+
+    batch_texts: List[str] = []
+    batch_meta: List[Tuple[str, str, str]] = []
+
+    for wsname, coord, text in to_translate_coords:
+        if text in cache:
+            translations[(wsname, coord)] = cache[text]
+            continue
+        batch_texts.append(text)
+        batch_meta.append((wsname, coord, text))
+
+        if len(batch_texts) >= batch_size:
+            out_lines = translate_batch_json(batch_texts, model=model)
+            for (s, c, orig), tr in zip(batch_meta, out_lines):
+                cache[orig] = tr
+                translations[(s, c)] = tr
+            batch_texts.clear()
+            batch_meta.clear()
+
+    if batch_texts:
+        out_lines = translate_batch_json(batch_texts, model=model)
+        for (s, c, orig), tr in zip(batch_meta, out_lines):
+            cache[orig] = tr
+            translations[(s, c)] = tr
+
+    # ---- PASS 2: open in normal mode and write translations ----
+    try:
+        wb = load_workbook(
+            filename=tmp_in_path,
+            data_only=False,
+            keep_vba=is_xlsm,
+        )
+        for (wsname, coord), tr in translations.items():
+            try:
+                wb[wsname][coord].value = tr
+            except Exception:
+                # skip cell if something odd happens, but don't crash whole job
+                continue
+    except Exception as e:
+        cleanup_files(tmp_in_path)
+        raise HTTPException(status_code=500, detail=f"Failed to apply translations: {e}")
 
     # ---- Save output to disk ----
     tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=f".{out_ext}")
